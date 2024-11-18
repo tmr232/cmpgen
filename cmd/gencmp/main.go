@@ -1,10 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"log"
+	"reflect"
+	"strings"
+	"text/template"
+
+	"github.com/pkg/errors"
 
 	"go/types"
 
@@ -140,15 +147,61 @@ func isStringLiteral(node ast.Node) bool {
 	return false
 }
 
+func getTypePackagePath(t types.Type) string {
+	switch t := t.(type) {
+	case *types.Basic:
+		return ""
+	case *types.Named:
+		return t.Obj().Pkg().Path()
+	case *types.Pointer:
+		return getTypePackagePath(t.Elem())
+	default:
+		panic("This should never happen as all types passed here should've been reachable")
+	}
+}
+
+func getValuePackagePath(def types.Object) string {
+	return def.Pkg().Path()
+}
+
 type TypeArg struct {
 	Type      types.Type
 	Reachable bool
 }
 
+func (t TypeArg) PackagePath() string {
+	if !t.Reachable {
+		return ""
+	}
+	return getTypePackagePath(t.Type)
+}
+
+func (t TypeArg) Code() string {
+	return t.Type.String()
+}
+
 type Argument struct {
 	TypeAndValue types.TypeAndValue
+	Expr         ast.Expr
 	Def          types.Object
 	Reachable    bool
+}
+
+func (a Argument) PackagePath() string {
+	if a.Def == nil {
+		return ""
+	}
+	return a.Def.Pkg().Path()
+}
+
+func (a Argument) Code() string {
+	if a.TypeAndValue.Value != nil {
+		return a.TypeAndValue.Value.ExactString()
+	}
+	if a.Def != nil {
+		return a.Def.Name()
+	}
+	return ""
 }
 
 type CallInfo struct {
@@ -183,7 +236,7 @@ func collectCallInfo(pkg *packages.Package, call *ast.CallExpr) CallInfo {
 
 		// If we have a constant, all is well
 		if argTypeAndValue.Value != nil {
-			arguments[i] = Argument{TypeAndValue: argTypeAndValue, Def: nil, Reachable: true}
+			arguments[i] = Argument{TypeAndValue: argTypeAndValue, Def: nil, Reachable: true, Expr: callArg}
 		} else {
 
 			// If the argument is named, make sure it's in a suitable scope
@@ -218,6 +271,89 @@ func isUsableType(t types.Type) bool {
 	}
 }
 
+type RegistryKey struct {
+	Type   reflect.Type
+	Fields string
+}
+
+var registry = make(map[RegistryKey]any)
+
+func NewRegistryKey[T any](fields ...string) RegistryKey {
+	return RegistryKey{Type: reflect.TypeOf(*new(T)), Fields: strings.Join(fields, ", ")}
+}
+
+func CmpByFields[T any](fields ...string) func(T, T) int {
+	regKey := NewRegistryKey[T](fields...)
+	if regFunc, ok := registry[regKey]; ok {
+		return regFunc.(func(T, T) int)
+	}
+	panic(fmt.Sprintf("No comparator registered for CmpByFields[%s](%s)", regKey.Type.Name(), regKey.Fields))
+}
+
+func GenerateCompareFunc(typeName string, fields ...string) string {
+	const tmpl = `registry[NewRegistryKey[{{.TypeName}}]({{join .QuotedFields ","}})] = func (a, b {{.TypeName}}) int {
+	return cmp.Or(
+		{{- range .Fields}}
+		cmp.Compare(a.{{.}}, b.{{.}}),
+		{{- end}}
+	)
+}`
+
+	funcTemplate := template.Must(template.New("compare").Funcs(template.FuncMap{
+		"join": strings.Join,
+	}).Parse(tmpl))
+
+	quotedFields := make([]string, len(fields))
+	for i, field := range fields {
+		quotedFields[i] = fmt.Sprintf("\"%s\"", field)
+	}
+
+	data := struct {
+		TypeName     string
+		Fields       []string
+		QuotedFields []string
+	}{
+		TypeName:     typeName,
+		Fields:       fields,
+		QuotedFields: quotedFields,
+	}
+
+	var buf bytes.Buffer
+	if err := funcTemplate.Execute(&buf, data); err != nil {
+		panic(err)
+	}
+
+	return buf.String()
+}
+
+func generateComparators(pkg *packages.Package) error {
+	for _, call := range findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "CmpByFields"}) {
+		callInfo := collectCallInfo(pkg, call)
+		// Ensure we have fields to compare by
+		if len(callInfo.Arguments) < 1 {
+			return errors.New("Must provide fields for comparison")
+		}
+		// Ensure all call arguments are string literals
+		for _, arg := range callInfo.Arguments {
+			if !isStringLiteral(arg.Expr) {
+				return errors.New("All arguments must be string literals")
+			}
+		}
+		// Ensure the type argument is reachable
+		typeArg := callInfo.TypeArguments[0]
+		if !typeArg.Reachable {
+			return errors.New("Type argument must be reachable")
+		}
+
+		fields := make([]string, 0)
+		for _, arg := range callInfo.Arguments {
+			fields = append(fields, constant.StringVal(arg.TypeAndValue.Value))
+		}
+		fmt.Println(GenerateCompareFunc(typeArg.Code(), fields...))
+	}
+	return nil
+}
+
 func targetFunc[T any](t T) {}
 
 type global struct{}
@@ -230,6 +366,7 @@ func app(dir string) {
 		X int
 	}
 	pkg := loadPackages(dir)
+
 	targetFunc(1)
 	targetFunc("A")
 	targetFunc(global{})
@@ -243,6 +380,8 @@ func app(dir string) {
 	targetFunc[MyType](MyType{x})
 	fmt.Println(findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}))
 
+	// TODO: Separate the search for calls into separate files (pkg.Syntax) so that we can generate
+	// 	     a file per file, and just copy the imports over instead of fiddling with them.
 	for _, call := range findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}) {
 		fmt.Println("Call:", pkg.Fset.Position(call.Pos()))
 		callInfo := collectCallInfo(pkg, call)
@@ -250,14 +389,26 @@ func app(dir string) {
 			if !arg.Reachable {
 				fmt.Println("Unreachable argument")
 			}
+			fmt.Println("Arg", arg.PackagePath(), arg.Code())
 		}
 		for _, typeArg := range callInfo.TypeArguments {
 			if !typeArg.Reachable {
 				fmt.Println("Unreachable type argument")
 			}
+			fmt.Println("Type Arg", typeArg.PackagePath(), typeArg.Code())
 		}
 	}
+	fmt.Println(pkg.Imports)
 
+	generateComparators(pkg)
+
+	for _, s := range pkg.Syntax {
+		fmt.Println(s.Name)
+	}
+}
+
+func trySort() {
+	CmpByFields[int]("A", "B")
 }
 
 //go:generate go run github.com/tmr232/goat/cmd/goater
