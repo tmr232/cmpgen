@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"go/ast"
 	"go/constant"
+	"go/format"
+	"go/printer"
 	"go/token"
 	"log"
 	"reflect"
+	"slices"
 	"strings"
 	"text/template"
 
@@ -132,10 +135,13 @@ func isCallTo(target callTarget, typesInfo *types.Info) func(*ast.CallExpr) bool
 	}
 }
 
+func findCallsIn(syntax *ast.File, typesInfo *types.Info, target callTarget) []*ast.CallExpr {
+	return findNodesIf(syntax, isCallTo(target, typesInfo))
+}
 func findCallsTo(pkg *packages.Package, target callTarget) []*ast.CallExpr {
 	var calls []*ast.CallExpr
 	for _, syntax := range pkg.Syntax {
-		calls = append(calls, findNodesIf(syntax, isCallTo(target, pkg.TypesInfo))...)
+		calls = append(calls, findCallsIn(syntax, pkg.TypesInfo, target)...)
 	}
 	return calls
 }
@@ -166,6 +172,7 @@ func getValuePackagePath(def types.Object) string {
 
 type TypeArg struct {
 	Type      types.Type
+	Expr      ast.Expr
 	Reachable bool
 }
 
@@ -218,21 +225,37 @@ func isReachableScope(scope *types.Scope) bool {
 	return isPackageScope(scope) || scope == types.Universe
 }
 
-func collectCallInfo(pkg *packages.Package, call *ast.CallExpr) CallInfo {
+func getCallTypeArgs(call *ast.CallExpr) []ast.Expr {
+	switch expr := call.Fun.(type) {
+	case *ast.IndexExpr:
+		return []ast.Expr{expr.Index}
+	case *ast.IndexListExpr:
+		return expr.Indices
+	default:
+		return make([]ast.Expr, 0)
+	}
+}
+
+func collectCallInfo(typesInfo *types.Info, call *ast.CallExpr) CallInfo {
 	ident := getCallIdent(call)
 
-	typeArgs := pkg.TypesInfo.Instances[ident].TypeArgs
+	typeArgs := typesInfo.Instances[ident].TypeArgs
 	typeArguments := make([]TypeArg, typeArgs.Len())
+	astTypeArgs := getCallTypeArgs(call)
 	for i := range typeArgs.Len() {
 		typeArg := typeArgs.At(i)
 		reachable := isUsableType(typeArg)
-		typeArguments[i] = TypeArg{Type: typeArg, Reachable: reachable}
+		var expr ast.Expr
+		if i < len(astTypeArgs) {
+			expr = astTypeArgs[i]
+		}
+		typeArguments[i] = TypeArg{Type: typeArg, Reachable: reachable, Expr: expr}
 	}
 
 	arguments := make([]Argument, len(call.Args))
 	// Arguments must either be constants or be defined in the package scope
 	for i, callArg := range call.Args {
-		argTypeAndValue := pkg.TypesInfo.Types[callArg]
+		argTypeAndValue := typesInfo.Types[callArg]
 
 		// If we have a constant, all is well
 		if argTypeAndValue.Value != nil {
@@ -244,7 +267,7 @@ func collectCallInfo(pkg *packages.Package, call *ast.CallExpr) CallInfo {
 			if argIdent == nil {
 				arguments[i] = Argument{TypeAndValue: argTypeAndValue, Def: nil, Reachable: true}
 			} else { // argIdent != nil
-				def := pkg.TypesInfo.Uses[argIdent]
+				def := typesInfo.Uses[argIdent]
 				arguments[i] = Argument{TypeAndValue: argTypeAndValue, Def: def, Reachable: isReachableScope(def.Parent())}
 			}
 		}
@@ -278,12 +301,16 @@ type RegistryKey struct {
 
 var registry = make(map[RegistryKey]any)
 
-func NewRegistryKey[T any](fields ...string) RegistryKey {
+func newRegistryKey[T any](fields ...string) RegistryKey {
 	return RegistryKey{Type: reflect.TypeOf(*new(T)), Fields: strings.Join(fields, ", ")}
 }
 
-func CmpByFields[T any](fields ...string) func(T, T) int {
-	regKey := NewRegistryKey[T](fields...)
+func Register[T any](fn any, fields ...string) {
+	registry[newRegistryKey[T](fields...)] = fn
+}
+
+func CmpByFields[T any](field string, fields ...string) func(T, T) int {
+	regKey := newRegistryKey[T](slices.Insert(fields, 0, field)...)
 	if regFunc, ok := registry[regKey]; ok {
 		return regFunc.(func(T, T) int)
 	}
@@ -291,13 +318,16 @@ func CmpByFields[T any](fields ...string) func(T, T) int {
 }
 
 func GenerateCompareFunc(typeName string, fields ...string) string {
-	const tmpl = `registry[NewRegistryKey[{{.TypeName}}]({{join .QuotedFields ","}})] = func (a, b {{.TypeName}}) int {
-	return cmp.Or(
-		{{- range .Fields}}
-		cmp.Compare(a.{{.}}, b.{{.}}),
-		{{- end}}
-	)
-}`
+	const tmpl = `Register[{{.TypeName}}](
+		func (a, b {{.TypeName}}) int {
+			return cmp.Or(
+				{{- range .Fields}}
+				cmp.Compare(a.{{.}}, b.{{.}}),
+				{{- end}}
+			)
+		},
+		{{join .QuotedFields ","}},
+		)`
 
 	funcTemplate := template.Must(template.New("compare").Funcs(template.FuncMap{
 		"join": strings.Join,
@@ -326,30 +356,116 @@ func GenerateCompareFunc(typeName string, fields ...string) string {
 	return buf.String()
 }
 
-func generateComparators(pkg *packages.Package) error {
-	for _, call := range findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "CmpByFields"}) {
-		callInfo := collectCallInfo(pkg, call)
-		// Ensure we have fields to compare by
-		if len(callInfo.Arguments) < 1 {
-			return errors.New("Must provide fields for comparison")
+func formatImports(imports []*ast.ImportSpec) string {
+	importLines := make([]string, 0)
+	for _, importSpec := range imports {
+		if importSpec.Name != nil {
+			importLines = append(importLines, fmt.Sprint(importSpec.Name.Name, importSpec.Path.Value))
+		} else {
+			importLines = append(importLines, importSpec.Path.Value)
 		}
+	}
+	return fmt.Sprintf("import (\n\t%s\n)", strings.Join(importLines, "\n\t"))
+}
+
+func formatSource(src string) string {
+	formattedSrc, err := format.Source([]byte(src))
+	if err != nil {
+		fmt.Println(src)
+		panic(err)
+	}
+	return string(formattedSrc)
+}
+
+func formatNode(fset *token.FileSet, node any) (string, error) {
+	var buf bytes.Buffer
+	err := printer.Fprint(&buf, fset, node)
+	if err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+func generateComparatorsForFile(file *ast.File, fset *token.FileSet, typesInfo *types.Info) (string, error) {
+	callInfos := make([]CallInfo, 0)
+	for _, call := range findCallsIn(file, typesInfo, callTarget{"go-sort-by-key/cmd/gencmp", "CmpByFields"}) {
+		callInfo := collectCallInfo(typesInfo, call)
 		// Ensure all call arguments are string literals
 		for _, arg := range callInfo.Arguments {
 			if !isStringLiteral(arg.Expr) {
-				return errors.New("All arguments must be string literals")
+				return "", errors.New("All arguments must be string literals")
 			}
 		}
 		// Ensure the type argument is reachable
 		typeArg := callInfo.TypeArguments[0]
 		if !typeArg.Reachable {
-			return errors.New("Type argument must be reachable")
+			return "", errors.New("Type argument must be reachable")
 		}
 
+		callInfos = append(callInfos, callInfo)
+	}
+
+	if len(callInfos) == 0 {
+		// No calls - no need to generate anything!
+		return "", nil
+	}
+
+	cmpFuncs := make([]string, 0)
+	for _, callInfo := range callInfos {
 		fields := make([]string, 0)
 		for _, arg := range callInfo.Arguments {
 			fields = append(fields, constant.StringVal(arg.TypeAndValue.Value))
 		}
-		fmt.Println(GenerateCompareFunc(typeArg.Code(), fields...))
+		typeArg, err := formatNode(fset, callInfo.TypeArguments[0].Expr)
+		if err != nil {
+			return "", errors.Wrap(err, "Failed to get type argument name")
+		}
+		cmpFuncs = append(cmpFuncs, GenerateCompareFunc(typeArg, fields...))
+	}
+
+	imports := formatImports(file.Imports)
+
+	init := fmt.Sprintf("func init() {\n%s\n}", strings.Join(cmpFuncs, "\n\n"))
+
+	source := fmt.Sprintf("package %s\n\n%s\n\n%s", file.Name.Name, imports, init)
+
+	return formatSource(source), nil
+
+}
+
+func generateComparators(pkg *packages.Package) error {
+	for _, syntax := range pkg.Syntax {
+		for _, call := range findCallsIn(syntax, pkg.TypesInfo, callTarget{"go-sort-by-key/cmd/gencmp", "CmpByFields"}) {
+			callInfo := collectCallInfo(pkg.TypesInfo, call)
+			// Ensure we have fields to compare by
+			if len(callInfo.Arguments) < 1 {
+				return errors.New("Must provide fields for comparison")
+			}
+			// Ensure all call arguments are string literals
+			for _, arg := range callInfo.Arguments {
+				if !isStringLiteral(arg.Expr) {
+					return errors.New("All arguments must be string literals")
+				}
+			}
+			// Ensure the type argument is reachable
+			typeArg := callInfo.TypeArguments[0]
+			if !typeArg.Reachable {
+				return errors.New("Type argument must be reachable")
+			}
+
+			fields := make([]string, 0)
+			for _, arg := range callInfo.Arguments {
+				fields = append(fields, constant.StringVal(arg.TypeAndValue.Value))
+			}
+			fmt.Println(GenerateCompareFunc(typeArg.Code(), fields...))
+		}
+		for _, importSpec := range syntax.Imports {
+			name := "<>"
+			if importSpec.Name != nil {
+				name = importSpec.Name.Name
+			}
+			fmt.Println(importSpec.Path.Value, name)
+		}
 	}
 	return nil
 }
@@ -384,7 +500,7 @@ func app(dir string) {
 	// 	     a file per file, and just copy the imports over instead of fiddling with them.
 	for _, call := range findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}) {
 		fmt.Println("Call:", pkg.Fset.Position(call.Pos()))
-		callInfo := collectCallInfo(pkg, call)
+		callInfo := collectCallInfo(pkg.TypesInfo, call)
 		for _, arg := range callInfo.Arguments {
 			if !arg.Reachable {
 				fmt.Println("Unreachable argument")
@@ -404,11 +520,15 @@ func app(dir string) {
 
 	for _, s := range pkg.Syntax {
 		fmt.Println(s.Name)
+		gen, _ := generateComparatorsForFile(s, pkg.Fset, pkg.TypesInfo)
+		fmt.Println(gen)
 	}
 }
 
 func trySort() {
 	CmpByFields[int]("A", "B")
+	CmpByFields[global]("A", "B")
+	CmpByFields[ast.BadDecl]("A", "B")
 }
 
 //go:generate go run github.com/tmr232/goat/cmd/goater
