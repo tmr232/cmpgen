@@ -8,7 +8,6 @@ import (
 
 	"go/types"
 
-	"github.com/pkg/errors"
 	"github.com/tmr232/goat"
 	"golang.org/x/tools/go/packages"
 )
@@ -141,11 +140,21 @@ func isStringLiteral(node ast.Node) bool {
 	return false
 }
 
+type TypeArg struct {
+	Type      types.Type
+	Reachable bool
+}
+
+type Argument struct {
+	TypeAndValue types.TypeAndValue
+	Def          types.Object
+	Reachable    bool
+}
+
 type CallInfo struct {
-	call     *ast.CallExpr
-	ident    *ast.Ident
-	typeArgs *types.TypeList
-	args     []types.TypeAndValue
+	Call          *ast.CallExpr
+	TypeArguments []TypeArg
+	Arguments     []Argument
 }
 
 func isPackageScope(scope *types.Scope) bool {
@@ -156,45 +165,44 @@ func isReachableScope(scope *types.Scope) bool {
 	return isPackageScope(scope) || scope == types.Universe
 }
 
-func collectCallInfo(pkg *packages.Package, call *ast.CallExpr) (CallInfo, error) {
+func collectCallInfo(pkg *packages.Package, call *ast.CallExpr) CallInfo {
 	ident := getCallIdent(call)
 
 	typeArgs := pkg.TypesInfo.Instances[ident].TypeArgs
-	// Ensure we can use the type args
+	typeArguments := make([]TypeArg, typeArgs.Len())
 	for i := range typeArgs.Len() {
 		typeArg := typeArgs.At(i)
-		if !isUsableType(typeArg) {
-			return CallInfo{}, errors.New("Type argument must be basic or named")
-		}
+		reachable := isUsableType(typeArg)
+		typeArguments[i] = TypeArg{Type: typeArg, Reachable: reachable}
 	}
 
-	args := make([]types.TypeAndValue, len(call.Args))
+	arguments := make([]Argument, len(call.Args))
 	// Arguments must either be constants or be defined in the package scope
 	for i, callArg := range call.Args {
 		argTypeAndValue := pkg.TypesInfo.Types[callArg]
-		args[i] = argTypeAndValue
 
 		// If we have a constant, all is well
 		if argTypeAndValue.Value != nil {
-			continue
-		}
+			arguments[i] = Argument{TypeAndValue: argTypeAndValue, Def: nil, Reachable: true}
+		} else {
 
-		// If the argument is named, make sure it's in a suitable scope
-		argIdent := getArgIdent(callArg)
-		if argIdent != nil {
-			def := pkg.TypesInfo.Uses[argIdent]
-			if !isReachableScope(def.Parent()) {
-				return CallInfo{}, errors.New("Named arguments must be reachable")
+			// If the argument is named, make sure it's in a suitable scope
+			argIdent := getArgIdent(callArg)
+			if argIdent == nil {
+				arguments[i] = Argument{TypeAndValue: argTypeAndValue, Def: nil, Reachable: true}
+			} else { // argIdent != nil
+				def := pkg.TypesInfo.Uses[argIdent]
+				arguments[i] = Argument{TypeAndValue: argTypeAndValue, Def: def, Reachable: isReachableScope(def.Parent())}
 			}
 		}
+
 	}
 
 	return CallInfo{
-		call:     call,
-		ident:    ident,
-		typeArgs: typeArgs,
-		args:     args,
-	}, nil
+		Call:          call,
+		TypeArguments: typeArguments,
+		Arguments:     arguments,
+	}
 }
 
 func isUsableType(t types.Type) bool {
@@ -237,10 +245,16 @@ func app(dir string) {
 
 	for _, call := range findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}) {
 		fmt.Println("Call:", pkg.Fset.Position(call.Pos()))
-		_, err := collectCallInfo(pkg, call)
-		if err != nil {
-			fmt.Println("Error at", pkg.Fset.Position(call.Pos()))
-			fmt.Println(err)
+		callInfo := collectCallInfo(pkg, call)
+		for _, arg := range callInfo.Arguments {
+			if !arg.Reachable {
+				fmt.Println("Unreachable argument")
+			}
+		}
+		for _, typeArg := range callInfo.TypeArguments {
+			if !typeArg.Reachable {
+				fmt.Println("Unreachable type argument")
+			}
 		}
 	}
 
