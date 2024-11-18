@@ -8,6 +8,7 @@ import (
 
 	"go/types"
 
+	"github.com/pkg/errors"
 	"github.com/tmr232/goat"
 	"golang.org/x/tools/go/packages"
 )
@@ -60,43 +61,67 @@ type callTarget struct {
 	Name    string
 }
 
-func isCallTo(target callTarget, typesInfo *types.Info) func(*ast.CallExpr) bool {
-	return func(queriedNode *ast.CallExpr) bool {
+func getCallIdent(callExpr *ast.CallExpr) *ast.Ident {
+	var node ast.Node = callExpr
 
-		var node ast.Node = queriedNode
-
-		for {
-			switch current := node.(type) {
-			case *ast.CallExpr:
-				node = current.Fun
-			case *ast.SelectorExpr:
-				node = current.Sel
-			case *ast.Ident:
-				definition, exists := typesInfo.Uses[current]
-				if !exists {
-					return false
-				}
-
-				funcDef, isFunc := definition.(*types.Func)
-				if !isFunc {
-					return false
-				}
-
-				if funcDef.Pkg() == nil {
-					return false
-				}
-				if funcDef.Pkg().Path() == target.PkgPath && funcDef.Name() == target.Name {
-					typeArgs := typesInfo.Instances[current].TypeArgs
-					for i := range typeArgs.Len() {
-						fmt.Println(typeArgs.At(i))
-					}
-					return true
-				}
-				return false
-			default:
-				return false
-			}
+	for {
+		switch current := node.(type) {
+		case *ast.CallExpr:
+			node = current.Fun
+		case *ast.IndexExpr:
+			node = current.X
+		case *ast.SelectorExpr:
+			node = current.Sel
+		case *ast.Ident:
+			return current
+		default:
+			return nil
 		}
+	}
+}
+
+func getArgIdent(arg ast.Expr) *ast.Ident {
+	var node ast.Node = arg
+	for {
+		switch current := node.(type) {
+		case *ast.SelectorExpr:
+			node = current.Sel
+		case *ast.Ident:
+			return current
+		case *ast.UnaryExpr:
+			node = current.X
+		default:
+			return nil
+		}
+	}
+}
+
+func isCallTo(target callTarget, typesInfo *types.Info) func(*ast.CallExpr) bool {
+	return func(node *ast.CallExpr) bool {
+
+		ident := getCallIdent(node)
+		if ident == nil {
+			//TODO: Does this ever happen?
+			return false
+		}
+
+		definition, exists := typesInfo.Uses[ident]
+		if !exists {
+			return false
+		}
+
+		funcDef, isFunc := definition.(*types.Func)
+		if !isFunc {
+			return false
+		}
+
+		if funcDef.Pkg() == nil {
+			return false
+		}
+		if funcDef.Pkg().Path() == target.PkgPath && funcDef.Name() == target.Name {
+			return true
+		}
+		return false
 
 	}
 }
@@ -116,23 +141,109 @@ func isStringLiteral(node ast.Node) bool {
 	return false
 }
 
-func targetFunc[T any](t T) {}
+type CallInfo struct {
+	call     *ast.CallExpr
+	ident    *ast.Ident
+	typeArgs *types.TypeList
+	args     []types.TypeAndValue
+}
 
-func app(dir string) {
-	goat.Flag(dir).Default("")
+func isPackageScope(scope *types.Scope) bool {
+	return scope.Parent() == types.Universe
+}
 
-	pkg := loadPackages(dir)
-	targetFunc(1)
-	targetFunc("A")
-	fmt.Println(findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}))
+func isReachableScope(scope *types.Scope) bool {
+	return isPackageScope(scope) || scope == types.Universe
+}
 
-	for _, call := range findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}) {
-		for _, arg := range call.Args {
-			if isStringLiteral(arg) {
-				fmt.Println(arg)
+func collectCallInfo(pkg *packages.Package, call *ast.CallExpr) (CallInfo, error) {
+	ident := getCallIdent(call)
+
+	typeArgs := pkg.TypesInfo.Instances[ident].TypeArgs
+	// Ensure we can use the type args
+	for i := range typeArgs.Len() {
+		typeArg := typeArgs.At(i)
+		if !isUsableType(typeArg) {
+			return CallInfo{}, errors.New("Type argument must be basic or named")
+		}
+	}
+
+	args := make([]types.TypeAndValue, len(call.Args))
+	// Arguments must either be constants or be defined in the package scope
+	for i, callArg := range call.Args {
+		argTypeAndValue := pkg.TypesInfo.Types[callArg]
+		args[i] = argTypeAndValue
+
+		// If we have a constant, all is well
+		if argTypeAndValue.Value != nil {
+			continue
+		}
+
+		// If the argument is named, make sure it's in a suitable scope
+		argIdent := getArgIdent(callArg)
+		if argIdent != nil {
+			def := pkg.TypesInfo.Uses[argIdent]
+			if !isReachableScope(def.Parent()) {
+				return CallInfo{}, errors.New("Named arguments must be reachable")
 			}
 		}
 	}
+
+	return CallInfo{
+		call:     call,
+		ident:    ident,
+		typeArgs: typeArgs,
+		args:     args,
+	}, nil
+}
+
+func isUsableType(t types.Type) bool {
+	switch t := t.(type) {
+	case *types.Basic:
+		return true
+	case *types.Named:
+		return isReachableScope(t.Obj().Parent())
+	case *types.Pointer:
+		return isUsableType(t.Elem())
+	default:
+		return false
+	}
+}
+
+func targetFunc[T any](t T) {}
+
+type global struct{}
+
+var x = 2
+
+func app(dir string) {
+	goat.Flag(dir).Default("")
+	type MyType struct {
+		X int
+	}
+	pkg := loadPackages(dir)
+	targetFunc(1)
+	targetFunc("A")
+	targetFunc(global{})
+	targetFunc(struct{}{})
+	a := 1
+	targetFunc(a)
+	targetFunc(x)
+	targetFunc(types.Universe)
+	targetFunc(&x)
+	targetFunc(MyType{x})
+	targetFunc[MyType](MyType{x})
+	fmt.Println(findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}))
+
+	for _, call := range findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}) {
+		fmt.Println("Call:", pkg.Fset.Position(call.Pos()))
+		_, err := collectCallInfo(pkg, call)
+		if err != nil {
+			fmt.Println("Error at", pkg.Fset.Position(call.Pos()))
+			fmt.Println(err)
+		}
+	}
+
 }
 
 //go:generate go run github.com/tmr232/goat/cmd/goater
