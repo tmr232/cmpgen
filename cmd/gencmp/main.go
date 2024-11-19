@@ -9,8 +9,6 @@ import (
 	"go/printer"
 	"go/token"
 	"log"
-	"reflect"
-	"slices"
 	"strings"
 	"text/template"
 
@@ -18,6 +16,7 @@ import (
 
 	"go/types"
 
+	"github.com/tmr232/cmpgen"
 	"github.com/tmr232/goat"
 	"golang.org/x/tools/go/packages"
 )
@@ -36,7 +35,7 @@ func loadPackages(dir string) *packages.Package {
 		Overlay:    nil,
 	}
 
-	pkgs, err := packages.Load(cfg)
+	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -113,9 +112,11 @@ func isCallTo(target callTarget, typesInfo *types.Info) func(*ast.CallExpr) bool
 			//TODO: Does this ever happen?
 			return false
 		}
+		fmt.Println("Ident", ident, target)
 
 		definition, exists := typesInfo.Uses[ident]
 		if !exists {
+			fmt.Println("Doesn't exist")
 			return false
 		}
 
@@ -127,6 +128,7 @@ func isCallTo(target callTarget, typesInfo *types.Info) func(*ast.CallExpr) bool
 		if funcDef.Pkg() == nil {
 			return false
 		}
+		fmt.Println(funcDef.Pkg().Path(), funcDef.Name())
 		if funcDef.Pkg().Path() == target.PkgPath && funcDef.Name() == target.Name {
 			return true
 		}
@@ -294,29 +296,6 @@ func isUsableType(t types.Type) bool {
 	}
 }
 
-type RegistryKey struct {
-	Type   reflect.Type
-	Fields string
-}
-
-var registry = make(map[RegistryKey]any)
-
-func newRegistryKey[T any](fields ...string) RegistryKey {
-	return RegistryKey{Type: reflect.TypeOf(*new(T)), Fields: strings.Join(fields, ", ")}
-}
-
-func Register[T any](fn any, fields ...string) {
-	registry[newRegistryKey[T](fields...)] = fn
-}
-
-func CmpByFields[T any](field string, fields ...string) func(T, T) int {
-	regKey := newRegistryKey[T](slices.Insert(fields, 0, field)...)
-	if regFunc, ok := registry[regKey]; ok {
-		return regFunc.(func(T, T) int)
-	}
-	panic(fmt.Sprintf("No comparator registered for CmpByFields[%s](%s)", regKey.Type.Name(), regKey.Fields))
-}
-
 func GenerateCompareFunc(typeName string, fields ...string) string {
 	const tmpl = `Register[{{.TypeName}}](
 		func (a, b {{.TypeName}}) int {
@@ -388,7 +367,7 @@ func formatNode(fset *token.FileSet, node any) (string, error) {
 
 func generateComparatorsForFile(file *ast.File, fset *token.FileSet, typesInfo *types.Info) (string, error) {
 	callInfos := make([]CallInfo, 0)
-	for _, call := range findCallsIn(file, typesInfo, callTarget{"go-sort-by-key/cmd/gencmp", "CmpByFields"}) {
+	for _, call := range findCallsIn(file, typesInfo, callTarget{"github.com/tmr232/cmpgen", "CmpByFields"}) {
 		callInfo := collectCallInfo(typesInfo, call)
 		// Ensure all call arguments are string literals
 		for _, arg := range callInfo.Arguments {
@@ -478,6 +457,7 @@ var x = 2
 
 func app(dir string) {
 	goat.Flag(dir).Default("")
+	fmt.Println(dir)
 	type MyType struct {
 		X int
 	}
@@ -494,41 +474,37 @@ func app(dir string) {
 	targetFunc(&x)
 	targetFunc(MyType{x})
 	targetFunc[MyType](MyType{x})
-	fmt.Println(findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}))
+	// fmt.Println(findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}))
 
-	// TODO: Separate the search for calls into separate files (pkg.Syntax) so that we can generate
-	// 	     a file per file, and just copy the imports over instead of fiddling with them.
-	for _, call := range findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}) {
-		fmt.Println("Call:", pkg.Fset.Position(call.Pos()))
-		callInfo := collectCallInfo(pkg.TypesInfo, call)
-		for _, arg := range callInfo.Arguments {
-			if !arg.Reachable {
-				fmt.Println("Unreachable argument")
-			}
-			fmt.Println("Arg", arg.PackagePath(), arg.Code())
-		}
-		for _, typeArg := range callInfo.TypeArguments {
-			if !typeArg.Reachable {
-				fmt.Println("Unreachable type argument")
-			}
-			fmt.Println("Type Arg", typeArg.PackagePath(), typeArg.Code())
-		}
-	}
-	fmt.Println(pkg.Imports)
+	// for _, call := range findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}) {
+	// 	fmt.Println("Call:", pkg.Fset.Position(call.Pos()))
+	// 	callInfo := collectCallInfo(pkg.TypesInfo, call)
+	// 	for _, arg := range callInfo.Arguments {
+	// 		if !arg.Reachable {
+	// 			fmt.Println("Unreachable argument")
+	// 		}
+	// 		fmt.Println("Arg", arg.PackagePath(), arg.Code())
+	// 	}
+	// 	for _, typeArg := range callInfo.TypeArguments {
+	// 		if !typeArg.Reachable {
+	// 			fmt.Println("Unreachable type argument")
+	// 		}
+	// 		fmt.Println("Type Arg", typeArg.PackagePath(), typeArg.Code())
+	// 	}
+	// }
 
-	generateComparators(pkg)
+	// generateComparators(pkg)
 
 	for _, s := range pkg.Syntax {
-		fmt.Println(s.Name)
 		gen, _ := generateComparatorsForFile(s, pkg.Fset, pkg.TypesInfo)
 		fmt.Println(gen)
 	}
 }
 
 func trySort() {
-	CmpByFields[int]("A", "B")
-	CmpByFields[global]("A", "B")
-	CmpByFields[ast.BadDecl]("A", "B")
+	cmpgen.CmpByFields[int]("A", "B")
+	cmpgen.CmpByFields[global]("A", "B")
+	cmpgen.CmpByFields[ast.BadDecl]("A", "B")
 }
 
 //go:generate go run github.com/tmr232/goat/cmd/goater
