@@ -12,6 +12,7 @@ type Person struct {
 	Age  int
 }
 
+//go:generate go run github.com/tmr232/cmpgen/cmd/cmpgen
 func main() {
 	people := []Person{
 		{"Gopher", 13},
@@ -22,5 +23,4 @@ func main() {
 	slices.SortFunc(people, cmpgen.CmpByFields[Person]("Name", "Age"))
 
 	fmt.Println(people)
-
 }
