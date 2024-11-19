@@ -55,6 +55,8 @@ func getArgIdent(arg ast.Expr) *ast.Ident {
 		switch current := node.(type) {
 		case *ast.SelectorExpr:
 			node = current.Sel
+		case *ast.CompositeLit:
+			node = current.Type
 		case *ast.Ident:
 			return current
 		case *ast.UnaryExpr:
@@ -214,7 +216,6 @@ func collectCallInfo(typesInfo *types.Info, call *ast.CallExpr) CallInfo {
 		if argTypeAndValue.Value != nil {
 			arguments[i] = Argument{TypeAndValue: argTypeAndValue, Def: nil, Reachable: true, Expr: callArg}
 		} else {
-
 			// If the argument is named, make sure it's in a suitable scope
 			argIdent := getArgIdent(callArg)
 			if argIdent == nil {
