@@ -108,7 +108,7 @@ func isStringLiteral(node ast.Node) bool {
 	return false
 }
 
-func generateComparatorsForFile(file *ast.File, fset *token.FileSet, typesInfo *types.Info) (string, error) {
+func GenerateComparatorsForFile(file *ast.File, fset *token.FileSet, typesInfo *types.Info) (string, error) {
 	callInfos := callector.CollectCalls("github.com/tmr232/cmpgen", "CmpByFields", file, fset, typesInfo)
 	for _, callInfo := range callInfos {
 		// Ensure all call arguments are string literals
@@ -160,7 +160,7 @@ func app(dir string) {
 	pkg := loadPackages(dir)
 
 	for _, file := range pkg.Syntax {
-		code, err := generateComparatorsForFile(file, pkg.Fset, pkg.TypesInfo)
+		code, err := GenerateComparatorsForFile(file, pkg.Fset, pkg.TypesInfo)
 		if err != nil {
 			panic(err)
 		}

@@ -3,19 +3,20 @@
 package main
 
 import (
-	"cmp"
-
+	"fmt"
+	"slices"
 	"github.com/tmr232/cmpgen"
+	"cmp"
 )
 
 func init() {
-	cmpgen.Register[Person](
-		func(a, b Person) int {
+cmpgen.Register[Person](
+		func (a, b Person) int {
 			return cmp.Or(
 				cmp.Compare(a.Name, b.Name),
 				cmp.Compare(a.Age, b.Age),
 			)
 		},
-		"Name", "Age",
-	)
+		"Name","Age",
+		)
 }
