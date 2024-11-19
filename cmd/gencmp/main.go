@@ -8,7 +8,6 @@ import (
 	"go/format"
 	"go/printer"
 	"go/token"
-	"log"
 	"strings"
 	"text/template"
 
@@ -17,287 +16,23 @@ import (
 	"go/types"
 
 	"github.com/tmr232/cmpgen"
+	"github.com/tmr232/cmpgen/callector"
 	"github.com/tmr232/goat"
 	"golang.org/x/tools/go/packages"
 )
 
 func loadPackages(dir string) *packages.Package {
-	cfg := &packages.Config{
-		Mode:       packages.NeedTypes | packages.NeedTypesInfo | packages.NeedFiles | packages.NeedSyntax | packages.NeedName | packages.NeedImports | packages.NeedDeps,
-		Context:    nil,
-		Logf:       nil,
-		Dir:        dir,
-		Env:        nil,
-		BuildFlags: nil,
-		Fset:       nil,
-		ParseFile:  nil,
-		Tests:      false,
-		Overlay:    nil,
-	}
-
-	pkgs, err := packages.Load(cfg, "./...")
+	pkg, err := callector.LoadPackage(dir)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
-	if len(pkgs) != 1 {
-		log.Fatalf("Expected 1 package, found %d", len(pkgs))
-	}
-
-	return pkgs[0]
-}
-
-func findNodesIf[T ast.Node](file *ast.File, pred func(node T) bool) []T {
-	var matchingNodes []T
-	for _, decl := range file.Decls {
-		ast.Inspect(decl, func(node ast.Node) bool {
-			if typedNode, isRightType := node.(T); isRightType {
-				if pred(typedNode) {
-					matchingNodes = append(matchingNodes, typedNode)
-					// We recurse the entire AST without stopping as there may be
-					// nested calls when we create subcommands.
-				}
-			}
-			return true
-		})
-	}
-	return matchingNodes
-}
-
-type callTarget struct {
-	PkgPath string
-	Name    string
-}
-
-func getCallIdent(callExpr *ast.CallExpr) *ast.Ident {
-	var node ast.Node = callExpr
-
-	for {
-		switch current := node.(type) {
-		case *ast.CallExpr:
-			node = current.Fun
-		case *ast.IndexExpr:
-			node = current.X
-		case *ast.SelectorExpr:
-			node = current.Sel
-		case *ast.Ident:
-			return current
-		default:
-			return nil
-		}
-	}
-}
-
-func getArgIdent(arg ast.Expr) *ast.Ident {
-	var node ast.Node = arg
-	for {
-		switch current := node.(type) {
-		case *ast.SelectorExpr:
-			node = current.Sel
-		case *ast.Ident:
-			return current
-		case *ast.UnaryExpr:
-			node = current.X
-		default:
-			return nil
-		}
-	}
-}
-
-func isCallTo(target callTarget, typesInfo *types.Info) func(*ast.CallExpr) bool {
-	return func(node *ast.CallExpr) bool {
-
-		ident := getCallIdent(node)
-		if ident == nil {
-			//TODO: Does this ever happen?
-			return false
-		}
-		fmt.Println("Ident", ident, target)
-
-		definition, exists := typesInfo.Uses[ident]
-		if !exists {
-			fmt.Println("Doesn't exist")
-			return false
-		}
-
-		funcDef, isFunc := definition.(*types.Func)
-		if !isFunc {
-			return false
-		}
-
-		if funcDef.Pkg() == nil {
-			return false
-		}
-		fmt.Println(funcDef.Pkg().Path(), funcDef.Name())
-		if funcDef.Pkg().Path() == target.PkgPath && funcDef.Name() == target.Name {
-			return true
-		}
-		return false
-
-	}
-}
-
-func findCallsIn(syntax *ast.File, typesInfo *types.Info, target callTarget) []*ast.CallExpr {
-	return findNodesIf(syntax, isCallTo(target, typesInfo))
-}
-func findCallsTo(pkg *packages.Package, target callTarget) []*ast.CallExpr {
-	var calls []*ast.CallExpr
-	for _, syntax := range pkg.Syntax {
-		calls = append(calls, findCallsIn(syntax, pkg.TypesInfo, target)...)
-	}
-	return calls
-}
-
-func isStringLiteral(node ast.Node) bool {
-	if basicLit, ok := node.(*ast.BasicLit); ok {
-		return basicLit.Kind == token.STRING
-	}
-	return false
-}
-
-func getTypePackagePath(t types.Type) string {
-	switch t := t.(type) {
-	case *types.Basic:
-		return ""
-	case *types.Named:
-		return t.Obj().Pkg().Path()
-	case *types.Pointer:
-		return getTypePackagePath(t.Elem())
-	default:
-		panic("This should never happen as all types passed here should've been reachable")
-	}
-}
-
-func getValuePackagePath(def types.Object) string {
-	return def.Pkg().Path()
-}
-
-type TypeArg struct {
-	Type      types.Type
-	Expr      ast.Expr
-	Reachable bool
-}
-
-func (t TypeArg) PackagePath() string {
-	if !t.Reachable {
-		return ""
-	}
-	return getTypePackagePath(t.Type)
-}
-
-func (t TypeArg) Code() string {
-	return t.Type.String()
-}
-
-type Argument struct {
-	TypeAndValue types.TypeAndValue
-	Expr         ast.Expr
-	Def          types.Object
-	Reachable    bool
-}
-
-func (a Argument) PackagePath() string {
-	if a.Def == nil {
-		return ""
-	}
-	return a.Def.Pkg().Path()
-}
-
-func (a Argument) Code() string {
-	if a.TypeAndValue.Value != nil {
-		return a.TypeAndValue.Value.ExactString()
-	}
-	if a.Def != nil {
-		return a.Def.Name()
-	}
-	return ""
-}
-
-type CallInfo struct {
-	Call          *ast.CallExpr
-	TypeArguments []TypeArg
-	Arguments     []Argument
-}
-
-func isPackageScope(scope *types.Scope) bool {
-	return scope.Parent() == types.Universe
-}
-
-func isReachableScope(scope *types.Scope) bool {
-	return isPackageScope(scope) || scope == types.Universe
-}
-
-func getCallTypeArgs(call *ast.CallExpr) []ast.Expr {
-	switch expr := call.Fun.(type) {
-	case *ast.IndexExpr:
-		return []ast.Expr{expr.Index}
-	case *ast.IndexListExpr:
-		return expr.Indices
-	default:
-		return make([]ast.Expr, 0)
-	}
-}
-
-func collectCallInfo(typesInfo *types.Info, call *ast.CallExpr) CallInfo {
-	ident := getCallIdent(call)
-
-	typeArgs := typesInfo.Instances[ident].TypeArgs
-	typeArguments := make([]TypeArg, typeArgs.Len())
-	astTypeArgs := getCallTypeArgs(call)
-	for i := range typeArgs.Len() {
-		typeArg := typeArgs.At(i)
-		reachable := isUsableType(typeArg)
-		var expr ast.Expr
-		if i < len(astTypeArgs) {
-			expr = astTypeArgs[i]
-		}
-		typeArguments[i] = TypeArg{Type: typeArg, Reachable: reachable, Expr: expr}
-	}
-
-	arguments := make([]Argument, len(call.Args))
-	// Arguments must either be constants or be defined in the package scope
-	for i, callArg := range call.Args {
-		argTypeAndValue := typesInfo.Types[callArg]
-
-		// If we have a constant, all is well
-		if argTypeAndValue.Value != nil {
-			arguments[i] = Argument{TypeAndValue: argTypeAndValue, Def: nil, Reachable: true, Expr: callArg}
-		} else {
-
-			// If the argument is named, make sure it's in a suitable scope
-			argIdent := getArgIdent(callArg)
-			if argIdent == nil {
-				arguments[i] = Argument{TypeAndValue: argTypeAndValue, Def: nil, Reachable: true}
-			} else { // argIdent != nil
-				def := typesInfo.Uses[argIdent]
-				arguments[i] = Argument{TypeAndValue: argTypeAndValue, Def: def, Reachable: isReachableScope(def.Parent())}
-			}
-		}
-
-	}
-
-	return CallInfo{
-		Call:          call,
-		TypeArguments: typeArguments,
-		Arguments:     arguments,
-	}
-}
-
-func isUsableType(t types.Type) bool {
-	switch t := t.(type) {
-	case *types.Basic:
-		return true
-	case *types.Named:
-		return isReachableScope(t.Obj().Parent())
-	case *types.Pointer:
-		return isUsableType(t.Elem())
-	default:
-		return false
-	}
+	return pkg
 }
 
 func GenerateCompareFunc(typeName string, fields ...string) string {
-	const tmpl = `Register[{{.TypeName}}](
+	// TODO: Ensure the package names are imported under these names.
+	const tmpl = `cmpgen.Register[{{.TypeName}}](
 		func (a, b {{.TypeName}}) int {
 			return cmp.Or(
 				{{- range .Fields}}
@@ -335,7 +70,7 @@ func GenerateCompareFunc(typeName string, fields ...string) string {
 	return buf.String()
 }
 
-func formatImports(imports []*ast.ImportSpec) string {
+func formatImports(imports []*ast.ImportSpec, extraImports ...string) string {
 	importLines := make([]string, 0)
 	for _, importSpec := range imports {
 		if importSpec.Name != nil {
@@ -344,6 +79,7 @@ func formatImports(imports []*ast.ImportSpec) string {
 			importLines = append(importLines, importSpec.Path.Value)
 		}
 	}
+	importLines = append(importLines, extraImports...)
 	return fmt.Sprintf("import (\n\t%s\n)", strings.Join(importLines, "\n\t"))
 }
 
@@ -364,11 +100,16 @@ func formatNode(fset *token.FileSet, node any) (string, error) {
 	}
 	return buf.String(), nil
 }
+func isStringLiteral(node ast.Node) bool {
+	if basicLit, ok := node.(*ast.BasicLit); ok {
+		return basicLit.Kind == token.STRING
+	}
+	return false
+}
 
 func generateComparatorsForFile(file *ast.File, fset *token.FileSet, typesInfo *types.Info) (string, error) {
-	callInfos := make([]CallInfo, 0)
-	for _, call := range findCallsIn(file, typesInfo, callTarget{"github.com/tmr232/cmpgen", "CmpByFields"}) {
-		callInfo := collectCallInfo(typesInfo, call)
+	callInfos := callector.CollectCalls("github.com/tmr232/cmpgen", "CmpByFields", file, fset, typesInfo)
+	for _, callInfo := range callInfos {
 		// Ensure all call arguments are string literals
 		for _, arg := range callInfo.Arguments {
 			if !isStringLiteral(arg.Expr) {
@@ -402,7 +143,7 @@ func generateComparatorsForFile(file *ast.File, fset *token.FileSet, typesInfo *
 		cmpFuncs = append(cmpFuncs, GenerateCompareFunc(typeArg, fields...))
 	}
 
-	imports := formatImports(file.Imports)
+	imports := formatImports(file.Imports, "\"cmp\"")
 
 	init := fmt.Sprintf("func init() {\n%s\n}", strings.Join(cmpFuncs, "\n\n"))
 
@@ -410,43 +151,6 @@ func generateComparatorsForFile(file *ast.File, fset *token.FileSet, typesInfo *
 
 	return formatSource(source), nil
 
-}
-
-func generateComparators(pkg *packages.Package) error {
-	for _, syntax := range pkg.Syntax {
-		for _, call := range findCallsIn(syntax, pkg.TypesInfo, callTarget{"go-sort-by-key/cmd/gencmp", "CmpByFields"}) {
-			callInfo := collectCallInfo(pkg.TypesInfo, call)
-			// Ensure we have fields to compare by
-			if len(callInfo.Arguments) < 1 {
-				return errors.New("Must provide fields for comparison")
-			}
-			// Ensure all call arguments are string literals
-			for _, arg := range callInfo.Arguments {
-				if !isStringLiteral(arg.Expr) {
-					return errors.New("All arguments must be string literals")
-				}
-			}
-			// Ensure the type argument is reachable
-			typeArg := callInfo.TypeArguments[0]
-			if !typeArg.Reachable {
-				return errors.New("Type argument must be reachable")
-			}
-
-			fields := make([]string, 0)
-			for _, arg := range callInfo.Arguments {
-				fields = append(fields, constant.StringVal(arg.TypeAndValue.Value))
-			}
-			fmt.Println(GenerateCompareFunc(typeArg.Code(), fields...))
-		}
-		for _, importSpec := range syntax.Imports {
-			name := "<>"
-			if importSpec.Name != nil {
-				name = importSpec.Name.Name
-			}
-			fmt.Println(importSpec.Path.Value, name)
-		}
-	}
-	return nil
 }
 
 func targetFunc[T any](t T) {}
