@@ -5,7 +5,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
 const (
@@ -32,9 +31,6 @@ func generateRandomName() string {
 
 // GenerateRandomPeople creates a slice of random Person structs
 func GenerateRandomPeople(count int) []Person {
-	// Seed the random number generator
-	rand.Seed(time.Now().UnixNano())
-
 	people := make([]Person, count)
 
 	for i := 0; i < count; i++ {

@@ -45,8 +45,8 @@ func collectForArg(t *testing.T, argument string) callector.Argument {
 	defer os.RemoveAll(tmpdir)
 
 	script := fmt.Sprintf(tmpl, argument)
-	os.WriteFile(filepath.Join(tmpdir, "main.go"), []byte(script), 0644)
-	os.WriteFile(filepath.Join(tmpdir, "go.mod"), []byte(modFile), 0644)
+	require.Nil(t, os.WriteFile(filepath.Join(tmpdir, "main.go"), []byte(script), 0644))
+	require.Nil(t, os.WriteFile(filepath.Join(tmpdir, "go.mod"), []byte(modFile), 0644))
 
 	pkg, err := callector.LoadPackage(tmpdir)
 	if err != nil {

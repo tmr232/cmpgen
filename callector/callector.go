@@ -100,13 +100,6 @@ func isCallTo(target callTarget, typesInfo *types.Info) func(*ast.CallExpr) bool
 func findCallsIn(syntax *ast.File, typesInfo *types.Info, target callTarget) []*ast.CallExpr {
 	return findNodesIf(syntax, isCallTo(target, typesInfo))
 }
-func findCallsTo(pkg *packages.Package, target callTarget) []*ast.CallExpr {
-	var calls []*ast.CallExpr
-	for _, syntax := range pkg.Syntax {
-		calls = append(calls, findCallsIn(syntax, pkg.TypesInfo, target)...)
-	}
-	return calls
-}
 
 func getTypePackagePath(t types.Type) string {
 	switch t := t.(type) {
@@ -119,10 +112,6 @@ func getTypePackagePath(t types.Type) string {
 	default:
 		panic("This should never happen as all types passed here should've been reachable")
 	}
-}
-
-func getValuePackagePath(def types.Object) string {
-	return def.Pkg().Path()
 }
 
 type TypeArg struct {
