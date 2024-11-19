@@ -7,15 +7,15 @@ import (
 	"strings"
 )
 
-type RegistryKey struct {
+type registryKey struct {
 	Type   reflect.Type
 	Fields string
 }
 
-var registry = make(map[RegistryKey]any)
+var registry = make(map[registryKey]any)
 
-func newRegistryKey[T any](fields ...string) RegistryKey {
-	return RegistryKey{Type: reflect.TypeOf(*new(T)), Fields: strings.Join(fields, ", ")}
+func newRegistryKey[T any](fields ...string) registryKey {
+	return registryKey{Type: reflect.TypeOf(*new(T)), Fields: strings.Join(fields, ", ")}
 }
 
 func Register[T any](fn any, fields ...string) {

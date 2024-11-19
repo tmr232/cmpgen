@@ -5,17 +5,17 @@ import (
 	"fmt"
 	"go/ast"
 	"go/constant"
-	"go/format"
 	"go/printer"
 	"go/token"
+	"os"
 	"strings"
 	"text/template"
 
-	"github.com/pkg/errors"
-
 	"go/types"
 
-	"github.com/tmr232/cmpgen"
+	"github.com/pkg/errors"
+	"golang.org/x/tools/imports"
+
 	"github.com/tmr232/cmpgen/callector"
 	"github.com/tmr232/goat"
 	"golang.org/x/tools/go/packages"
@@ -83,13 +83,14 @@ func formatImports(imports []*ast.ImportSpec, extraImports ...string) string {
 	return fmt.Sprintf("import (\n\t%s\n)", strings.Join(importLines, "\n\t"))
 }
 
-func formatSource(src string) string {
-	formattedSrc, err := format.Source([]byte(src))
+func removeUnusedImports(filename, src string) (string, error) {
+
+	processed, err := imports.Process(filename, []byte(src), nil)
 	if err != nil {
-		fmt.Println(src)
-		panic(err)
+		return "", fmt.Errorf("import processing error: %v", err)
 	}
-	return string(formattedSrc)
+
+	return string(processed), nil
 }
 
 func formatNode(fset *token.FileSet, node any) (string, error) {
@@ -121,8 +122,6 @@ func generateComparatorsForFile(file *ast.File, fset *token.FileSet, typesInfo *
 		if !typeArg.Reachable {
 			return "", errors.New("Type argument must be reachable")
 		}
-
-		callInfos = append(callInfos, callInfo)
 	}
 
 	if len(callInfos) == 0 {
@@ -149,66 +148,38 @@ func generateComparatorsForFile(file *ast.File, fset *token.FileSet, typesInfo *
 
 	source := fmt.Sprintf("package %s\n\n%s\n\n%s", file.Name.Name, imports, init)
 
-	return formatSource(source), nil
+	return source, nil
 
 }
-
-func targetFunc[T any](t T) {}
-
-type global struct{}
-
-var x = 2
 
 func app(dir string) {
 	goat.Flag(dir).Default("")
-	fmt.Println(dir)
-	type MyType struct {
-		X int
-	}
+
 	pkg := loadPackages(dir)
 
-	targetFunc(1)
-	targetFunc("A")
-	targetFunc(global{})
-	targetFunc(struct{}{})
-	a := 1
-	targetFunc(a)
-	targetFunc(x)
-	targetFunc(types.Universe)
-	targetFunc(&x)
-	targetFunc(MyType{x})
-	targetFunc[MyType](MyType{x})
-	// fmt.Println(findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}))
+	for _, file := range pkg.Syntax {
+		code, err := generateComparatorsForFile(file, pkg.Fset, pkg.TypesInfo)
+		if err != nil {
+			panic(err)
+		}
+		if code == "" {
+			continue
+		}
 
-	// for _, call := range findCallsTo(pkg, callTarget{"go-sort-by-key/cmd/gencmp", "targetFunc"}) {
-	// 	fmt.Println("Call:", pkg.Fset.Position(call.Pos()))
-	// 	callInfo := collectCallInfo(pkg.TypesInfo, call)
-	// 	for _, arg := range callInfo.Arguments {
-	// 		if !arg.Reachable {
-	// 			fmt.Println("Unreachable argument")
-	// 		}
-	// 		fmt.Println("Arg", arg.PackagePath(), arg.Code())
-	// 	}
-	// 	for _, typeArg := range callInfo.TypeArguments {
-	// 		if !typeArg.Reachable {
-	// 			fmt.Println("Unreachable type argument")
-	// 		}
-	// 		fmt.Println("Type Arg", typeArg.PackagePath(), typeArg.Code())
-	// 	}
-	// }
+		filepath := pkg.Fset.File(file.Pos()).Name()
+		filepath = strings.TrimSuffix(filepath, ".go")
+		filepath = filepath + "_cmpgen.go"
 
-	// generateComparators(pkg)
+		code, err = removeUnusedImports(filepath, code)
+		if err != nil {
+			panic(err)
+		}
 
-	for _, s := range pkg.Syntax {
-		gen, _ := generateComparatorsForFile(s, pkg.Fset, pkg.TypesInfo)
-		fmt.Println(gen)
+		err = os.WriteFile(filepath, []byte(code), 0644)
+		if err != nil {
+			panic(err)
+		}
 	}
-}
-
-func trySort() {
-	cmpgen.CmpByFields[int]("A", "B")
-	cmpgen.CmpByFields[global]("A", "B")
-	cmpgen.CmpByFields[ast.BadDecl]("A", "B")
 }
 
 //go:generate go run github.com/tmr232/goat/cmd/goater

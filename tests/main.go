@@ -124,7 +124,6 @@ func main() {
 		{"Alice", 20},
 	}
 	slices.SortFunc(people, CmpFields[Person]("Name", "Age"))
-
 	fmt.Println(people)
 
 	cmpKey := Chain(

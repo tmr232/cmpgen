@@ -1,7 +1,6 @@
 package callector
 
 import (
-	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -74,11 +73,9 @@ func isCallTo(target callTarget, typesInfo *types.Info) func(*ast.CallExpr) bool
 			//TODO: Does this ever happen?
 			return false
 		}
-		fmt.Println("Ident", ident, target)
 
 		definition, exists := typesInfo.Uses[ident]
 		if !exists {
-			fmt.Println("Doesn't exist")
 			return false
 		}
 
@@ -90,7 +87,6 @@ func isCallTo(target callTarget, typesInfo *types.Info) func(*ast.CallExpr) bool
 		if funcDef.Pkg() == nil {
 			return false
 		}
-		fmt.Println(funcDef.Pkg().Path(), funcDef.Name())
 		if funcDef.Pkg().Path() == target.PkgPath && funcDef.Name() == target.Name {
 			return true
 		}
